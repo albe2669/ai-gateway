@@ -1,0 +1,220 @@
+# Copyright Envoy AI Gateway Authors
+# SPDX-License-Identifier: Apache-2.0
+# The full text of the Apache license is available in the LICENSE file at
+# the root of the repo.
+
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: first-token-timeout
+spec:
+  controllerName: gateway.envoyproxy.io/gatewayclass-controller
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: first-token-timeout
+  namespace: default
+spec:
+  gatewayClassName: first-token-timeout
+  listeners:
+    - name: http
+      protocol: HTTP
+      port: 80
+  infrastructure:
+    parametersRef:
+      group: gateway.envoyproxy.io
+      kind: EnvoyProxy
+      name: first-token-timeout
+---
+apiVersion: aigateway.envoyproxy.io/v1beta1
+kind: AIGatewayRoute
+metadata:
+  name: first-token-timeout
+  namespace: default
+spec:
+  parentRefs:
+    - name: first-token-timeout
+      kind: Gateway
+      group: gateway.networking.k8s.io
+  rules:
+    - matches:
+        - headers:
+            - type: Exact
+              name: x-ai-eg-model
+              value: ttft-demo
+      # Overall response deadline.
+      timeouts:
+        request: 30s
+      # First-byte deadline applied to the upstream stream. Envoy will reset the
+      # upstream stream if no byte arrives within 5s of forwarding the request.
+      firstTokenTimeout: 5s
+      backendRefs:
+        - name: first-token-timeout-silent # Priority 0: never sends a first byte.
+          priority: 0
+        - name: first-token-timeout-healthy # Priority 1: streams an SSE response.
+          priority: 1
+---
+apiVersion: aigateway.envoyproxy.io/v1beta1
+kind: AIServiceBackend
+metadata:
+  name: first-token-timeout-silent
+  namespace: default
+spec:
+  schema:
+    name: OpenAI
+  backendRef:
+    name: first-token-timeout-silent
+    kind: Backend
+    group: gateway.envoyproxy.io
+---
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: Backend
+metadata:
+  name: first-token-timeout-silent
+  namespace: default
+spec:
+  endpoints:
+    - fqdn:
+        hostname: first-token-timeout-silent.default.svc.cluster.local
+        port: 8080
+---
+apiVersion: aigateway.envoyproxy.io/v1beta1
+kind: AIServiceBackend
+metadata:
+  name: first-token-timeout-healthy
+  namespace: default
+spec:
+  schema:
+    name: OpenAI
+  backendRef:
+    name: first-token-timeout-healthy
+    kind: Backend
+    group: gateway.envoyproxy.io
+---
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: Backend
+metadata:
+  name: first-token-timeout-healthy
+  namespace: default
+spec:
+  endpoints:
+    - fqdn:
+        hostname: first-token-timeout-healthy.default.svc.cluster.local
+        port: 8080
+---
+# Silent upstream: accepts the TCP connection and holds it open without ever
+# writing a byte back.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: first-token-timeout-silent-script
+  namespace: default
+data:
+  silent.py: |
+    import socket, sys
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(("0.0.0.0", 8080))
+    s.listen(128)
+    sys.stderr.write("silent upstream listening on :8080\n")
+    sys.stderr.flush()
+    while True:
+        conn, addr = s.accept()
+        sys.stderr.write(f"accepted from {addr}; keeping it silent\n")
+        sys.stderr.flush()
+        # Intentionally don't recv / don't send. Hold the connection open
+        # until Envoy gives up.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: first-token-timeout-silent
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: first-token-timeout-silent
+  template:
+    metadata:
+      labels:
+        app: first-token-timeout-silent
+    spec:
+      containers:
+        - name: silent
+          image: python:3.12-alpine
+          command: ["python", "/scripts/silent.py"]
+          ports:
+            - containerPort: 8080
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+      volumes:
+        - name: scripts
+          configMap:
+            name: first-token-timeout-silent-script
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: first-token-timeout-silent
+  namespace: default
+spec:
+  selector:
+    app: first-token-timeout-silent
+  ports:
+    - protocol: TCP
+      port: 8080
+      targetPort: 8080
+  type: ClusterIP
+---
+# Healthy upstream
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: first-token-timeout-healthy
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: first-token-timeout-healthy
+  template:
+    metadata:
+      labels:
+        app: first-token-timeout-healthy
+    spec:
+      containers:
+        - name: testupstream
+          image: docker.io/envoyproxy/ai-gateway-testupstream:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: first-token-timeout-healthy
+  namespace: default
+spec:
+  selector:
+    app: first-token-timeout-healthy
+  ports:
+    - protocol: TCP
+      port: 8080
+      targetPort: 8080
+  type: ClusterIP
+---
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: EnvoyProxy
+metadata:
+  name: first-token-timeout
+  namespace: default
+spec:
+  provider:
+    type: Kubernetes
+    kubernetes:
+      envoyDeployment:
+        container:
+          resources: {}
